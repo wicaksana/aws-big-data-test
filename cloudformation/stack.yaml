@@ -1,0 +1,99 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: AWS Big Data test
+
+Metadata:
+  Author: Muhammad Arif WIcaksana
+
+Parameters:
+  ResourcePrefix:
+    Description: Prefix for resource naming
+    Type: String
+    Default: cf-infra
+
+Resources:
+  ######################################################################################################################
+  # Firehose
+  ######################################################################################################################
+  InfraKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key to encrypt Firehose output
+      Enabled: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+          - Sid: 'Enable IAM User Permissions'
+            Effect: 'Allow'
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - 'kms:*'
+            Resource: '*'
+
+  ######################################################################################################################
+  # Firehose
+  ######################################################################################################################
+  InfraFirehoseIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: InfraFirehoseIAMRoleAccessS3Bucket
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:AbortMultipartUpload'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:ListBucketMultipartUploads'
+                  - 's3:PutObject'
+                Resource:
+                  - !Join ['', ['arn:aws:s3:::', !Ref InfraS3Bucket]]
+                  - !Join ['', ['arn:aws:s3:::', !Ref InfraS3Bucket, '/*']]
+        - PolicyName: InfraFirehoseIAMRoleAccessKMSKey
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource:
+                  - !Join ['', [!Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/', !Ref InfraKMSKey]]
+
+  InfraFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+       DeliveryStreamName: !Join ['-', [!Ref ResourcePrefix, 'firehose', 'delivery-stream']]
+       DeliveryStreamType: DirectPut
+       S3DestinationConfiguration:
+         BucketARN: !GetAtt InfraS3Bucket.Arn
+         CompressionFormat: GZIP
+         EncryptionConfiguration:
+           KMSEncryptionConfig:
+             AWSKMSKeyARN: !GetAtt InfraKMSKey.Arn
+         RoleARN: !GetAtt InfraFirehoseIAMRole.Arn
+         BufferingHints:
+           IntervalInSeconds: 60
+           SizeInMBs: 5
+
+  ######################################################################################################################
+  # S3
+  ######################################################################################################################
+  InfraS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: 'com.wicaksana.bigdata'
+
