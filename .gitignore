@@ -1,0 +1,4 @@
+.idea/
+venv/
+lambda_layer/python
+lambda_layer/base_layer.zip

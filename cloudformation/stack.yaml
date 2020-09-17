@@ -33,6 +33,45 @@ Resources:
             Resource: '*'
 
   ######################################################################################################################
+  # IAM role for glue crawler
+  ######################################################################################################################
+  GlueCrawlerIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+      Policies:
+        - PolicyName: GlueCrawlerIAMRoleAccessBucket
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource:
+                  - !Join ['', ['arn:aws:s3:::', !Ref InfraS3Bucket]]
+                  - !Join ['', ['arn:aws:s3:::', !Ref InfraS3Bucket, '/*']]
+        - PolicyName: GlueCrawlerIAMRoleAccesKMSKey
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource:
+                  - '*'
+
+  ######################################################################################################################
   # Firehose
   ######################################################################################################################
   InfraFirehoseIAMRole:
@@ -72,22 +111,556 @@ Resources:
                   - 'kms:GenerateDataKey'
                 Resource:
                   - !Join ['', [!Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/', !Ref InfraKMSKey]]
+        - PolicyName: InfraFirehoseIAMRoleInvokeTransformationLambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                  - 'lambda:GetFunctionConfiguration'
+                Resource:
+                  - !Join ['', [!Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:', !Ref InfraTransformationLambda,':$LATEST']]
+        - PolicyName: InfraFirehoseIAMRoleAccessGlueTable
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'glue:GetTable'
+                  - 'glue:GetTableVersion'
+                  - 'glue:GetTableVersions'
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:*'
 
   InfraFirehose:
     Type: AWS::KinesisFirehose::DeliveryStream
     Properties:
-       DeliveryStreamName: !Join ['-', [!Ref ResourcePrefix, 'firehose', 'delivery-stream']]
-       DeliveryStreamType: DirectPut
-       S3DestinationConfiguration:
-         BucketARN: !GetAtt InfraS3Bucket.Arn
-         CompressionFormat: GZIP
-         EncryptionConfiguration:
-           KMSEncryptionConfig:
-             AWSKMSKeyARN: !GetAtt InfraKMSKey.Arn
-         RoleARN: !GetAtt InfraFirehoseIAMRole.Arn
-         BufferingHints:
-           IntervalInSeconds: 60
-           SizeInMBs: 5
+      DeliveryStreamName: !Join ['-', [!Ref ResourcePrefix, 'firehose', 'delivery-stream']]
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt InfraS3Bucket.Arn
+        EncryptionConfiguration:
+          KMSEncryptionConfig:
+            AWSKMSKeyARN: !GetAtt InfraKMSKey.Arn
+        RoleARN: !GetAtt InfraFirehoseIAMRole.Arn
+        Prefix: output/
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+#        DataFormatConversionConfiguration:
+#          Enabled: true
+#          InputFormatConfiguration:
+#            Deserializer:
+#              HiveJsonSerDe:
+#                TimestampFormats:
+#                  - millis
+#          OutputFormatConfiguration:
+#            Serializer:
+#              ParquetSerDe:
+#                Compression: SNAPPY
+#          SchemaConfiguration:
+
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !Join ['', [!Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:', !Ref InfraTransformationLambda,':$LATEST']]
+                - ParameterName: RoleArn
+                  ParameterValue: !GetAtt InfraFirehoseIAMRole.Arn
+
+  ######################################################################################################################
+  # lambda to transform Kinesis Firehose records
+  ######################################################################################################################
+  InfraTransformationLambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: InfraTransformationLambdaLogPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - 'arn:aws:logs:*:*:*'
+
+  InfraTransformationLambdaBaseLayer:
+    DependsOn: InfraS3Bucket
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.7
+      Content:
+        S3Bucket: com.wicaksana.bigdata
+        S3Key: layers/base_layer.zip
+      LayerName: !Join ['-', [!Ref ResourcePrefix, 'transformation-lambda-base-layer']]
+
+  InfraTransformationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Join ['-', [!Ref ResourcePrefix, 'transformation-lambda']]
+      Handler: index.handler
+      Layers:
+        - !Ref InfraTransformationLambdaBaseLayer
+      MemorySize: 128
+      Timeout: 120
+      Role: !GetAtt InfraTransformationLambdaIAMRole.Arn
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          from datetime import datetime
+          import pytz
+
+          eastern = pytz.timezone('US/Eastern')
+
+
+          def handler(event, context):
+              output = []
+
+              for record in event['records']:
+                  payload = json.loads(base64.b64decode(record['data']))
+
+                  transformed_payload = {
+                      'ticker_symbol': payload['ticker_symbol'],
+                      'sector': payload['sector'],
+                      'change': payload['change'],
+                      'price': payload['price'],
+                      'trend': 'up' if payload['change'] > 0 else ('down' if payload['change'] < 0 else 'level'),
+                      'timestamp': round(datetime.now().astimezone(eastern).timestamp())
+                  }
+
+                  result = {
+                      'recordId': record['recordId'],
+                      'result': 'Ok',
+                      'data': base64.b64encode(json.dumps(transformed_payload).encode()).decode("utf-8")
+                  }
+                  output.append(result)
+
+              return {'records': output}
+
+  InfraTransformationLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref InfraTransformationLambda
+      Principal: 'firehose.amazonaws.com'
+      SourceArn: !GetAtt InfraFirehose.Arn
+
+  ######################################################################################################################
+  # lambda to query athena
+  ######################################################################################################################
+  AthenaQueryLambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: AthenaQueryLambdaIAMRoleFullAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'athena:*'
+                Resource:
+                  - '*'
+              - Effect: Allow
+                Action:
+                  - 'glue:*'
+                Resource:
+                  - '*' 
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource:
+                  - !Join ['', ['arn:aws:s3:::', !Ref InfraS3Bucket]]
+                  - !Join ['', ['arn:aws:s3:::', !Ref InfraS3Bucket, '/*']]
+        - PolicyName: AthenaQueryLambdaLogPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - 'arn:aws:logs:*:*:*'
+        - PolicyName: AthenaQueryLambdaIAMRoleAccesKMSKey
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource:
+                  - '*'
+
+  AthenaQueryLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Join ['-', [!Ref ResourcePrefix, 'athena-query-lambda']]
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 120
+      Role: !GetAtt AthenaQueryLambdaIAMRole.Arn
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import time
+          import boto3
+          import json
+
+          DATABASE = 'test'
+          TABLE = 'ticker_transformed_output'
+
+          S3_OUTPUT = 's3://com.wicaksana.bigdata/athena_output'
+          RETRY_COUNT = 3
+
+          def handler(event, context):    
+              start = float(event['params']['querystring']['from'])
+              stop = float(event['params']['querystring']['to'])
+
+              # create query
+              query = f'SELECT * FROM {DATABASE}.{TABLE} WHERE timestamp >= {start} AND timestamp <= {stop}'
+
+              client = boto3.client('athena')
+              response = client.start_query_execution(
+                  QueryString = query,
+                  QueryExecutionContext = {
+                      'Database': DATABASE
+                  },
+                  ResultConfiguration={
+                      'OutputLocation': S3_OUTPUT,
+                  }
+              )
+
+              # get query execution id
+              query_execution_id = response['QueryExecutionId']
+              print(query_execution_id)
+
+              # get execution status
+              for i in range(1, 1 + RETRY_COUNT):
+                  # get query execution
+                  query_status = client.get_query_execution(QueryExecutionId=query_execution_id)
+                  query_execution_status = query_status['QueryExecution']['Status']['State']
+
+                  if query_execution_status == 'SUCCEEDED':
+                      print("STATUS:" + query_execution_status)
+                      break
+                  
+                  if query_execution_status == 'FAILED':
+                      raise Exception("STATUS:" + query_execution_status)
+
+                  else:
+                      print("STATUS:" + query_execution_status)
+                      time.sleep(i)
+
+              else:
+                  client.stop_query_execution(QueryExecutionId=query_execution_id)
+                  raise Exception('TIME OVER')
+
+              # get query results
+              result = client.get_query_results(QueryExecutionId=query_execution_id)
+              
+              returned_result = []
+              query_results = result['ResultSet']['Rows']
+
+              if len(query_results) > 1:
+                  for res in query_results[1:]:
+                      item = {
+                          'ticker_symbol': res['Data'][0]['VarCharValue'],
+                          'sector': res['Data'][1]['VarCharValue'],
+                          'change': float(res['Data'][2]['VarCharValue']),
+                          'price': float(res['Data'][3]['VarCharValue']),
+                          'trend': res['Data'][4]['VarCharValue'],
+                          'timestamp': float(res['Data'][5]['VarCharValue'])
+                      }
+                      returned_result.append(item)
+              
+              return returned_result
+
+  AthenaQueryLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref AthenaQueryLambda
+      Principal: 'apigateway.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${InfraApiGateway}/*'
+  
+
+  ######################################################################################################################
+  # API Gateway
+  ######################################################################################################################
+  InfraApiGatewayIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs'
+
+  InfraApiGatewayAccount:
+    Type: 'AWS::ApiGateway::Account'
+    Properties:
+      CloudWatchRoleArn: !GetAtt InfraApiGatewayIAMRole.Arn
+
+  InfraApiGateway:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: !Join ['-', [!Ref ResourcePrefix, 'api-gateway']]
+      Policy:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - 'execute-api:Invoke'
+            Resource:
+              - !Join ['', ['execute-api:/', '*']]
+
+  InfraApiGatewayResourceV1:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref InfraApiGateway
+      ParentId: !GetAtt
+        - InfraApiGateway
+        - RootResourceId
+      PathPart: v1
+
+  InfraApiGatewayResourceTicks:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref InfraApiGateway
+      ParentId: !Ref InfraApiGatewayResourceV1
+      PathPart: ticks
+
+  InfraApiGatewayResourceTicksMethodGet:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      HttpMethod: GET
+      ResourceId: !Ref InfraApiGatewayResourceTicks
+      RestApiId: !Ref InfraApiGateway
+      AuthorizationType: NONE
+      OperationName: 'GetTicks'
+      RequestValidatorId: !Ref InfraApiGatewayResourceTicksRequestValidator
+      RequestParameters:
+        method.request.querystring.from: true
+        method.request.querystring.to: true
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: 'AWS'
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AthenaQueryLambda}/invocations'
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          # pass-through
+          application/json: >
+            #set($allParams = $input.params())
+            {
+            "body-json" : $input.json('$'),
+            "params" : {
+            #foreach($type in $allParams.keySet())
+                #set($params = $allParams.get($type))
+            "$type" : {
+                #foreach($paramName in $params.keySet())
+                "$paramName" : "$util.escapeJavaScript($params.get($paramName))"
+                    #if($foreach.hasNext),#end
+                #end
+            }
+                #if($foreach.hasNext),#end
+            #end
+            },
+            "stage-variables" : {
+                #foreach($key in $stageVariables.keySet())
+                "$key" : "$util.escapeJavaScript($stageVariables.get($key))"
+                    #if($foreach.hasNext),#end
+                #end
+                }
+            }
+        IntegrationResponses:
+          - StatusCode: 200
+          - StatusCode: 400
+            SelectionPattern: 'Invalid.*'
+          - StatusCode: 500
+            SelectionPattern: '.*exit status 1'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+        - StatusCode: 400
+          ResponseModels:
+            application/json: Empty
+        - StatusCode: 500
+          ResponseModels:
+            application/json: Empty
+
+  InfraApiGatewayResourceTicksRequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      Name: query-params-validator
+      RestApiId: !Ref InfraApiGateway
+      ValidateRequestParameters: true
+
+  InfraApiGatewayDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn:
+      - InfraApiGatewayResourceTicksMethodGet
+    Properties:
+      RestApiId: !Ref InfraApiGateway
+
+  InfraApiGatewayStage:
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      RestApiId: !Ref InfraApiGateway
+      StageName: 'api'
+      DeploymentId: !Ref InfraApiGatewayDeployment      
+
+  ######################################################################################################################
+  # Lambda to load ticker data
+  ######################################################################################################################
+  LoadTickerDataLambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: LoadTickerDataLambdaIAMRolePushLogs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - 'arn:aws:logs:*:*:*'
+        - PolicyName: LoadTickerDataLambdaIAMRolePutRecordsToFirehose
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'firehose:DescribeDeliveryStream'
+                  - 'firehose:ListDeliveryStreams'
+                  - 'firehose:PutRecord'
+                  - 'firehose:PutRecordBatch'
+                Resource:
+                  - '*'
+
+  LoadTickerDataLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Join ['-', [!Ref ResourcePrefix, 'load-ticker-data-lambda']]
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 120
+      Role: !GetAtt LoadTickerDataLambdaIAMRole.Arn
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import boto3
+          import base64
+          import json
+          import random
+          import string
+
+          def handler(event, context):
+              client = boto3.client('firehose')
+
+              sectors = ['FINANCIAL', 'TECHNOLOGY', 'RETAIL', 'ENERGY', 'HEALTHCARE']
+
+              records = []
+
+              for i in range(10):        
+                  payload = {
+                          'ticker_symbol': ''.join(random.choices(string.ascii_uppercase, k=3)),
+                          'sector': sectors[random.randint(0, len(sectors) - 1)],
+                          'change': round(random.uniform(-8, 8), 2),
+                          'price': round(random.uniform(1, 150), 2)
+                  }
+                  record = {
+                      'Data': json.dumps(payload).encode('utf-8')
+                  }
+                  records.append(record)
+
+              response = client.put_record_batch(
+                  DeliveryStreamName='cf-infra-firehose-delivery-stream',
+                  Records=records
+              )
+              
+              # best-effort
+              return 'OK'
+
+  LoadTickerDataLambdaEventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      ScheduleExpression: cron(0/30 * * * ? *)
+      State: 'ENABLED'
+      Targets:
+        - Arn:
+            !GetAtt
+            - LoadTickerDataLambda
+            - Arn
+          Id: !Join ['-', [!Ref ResourcePrefix, 'load-ticker-data-lambda-target']]
+
+  LoadTickerDataLambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref LoadTickerDataLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt
+        - LoadTickerDataLambdaEventRule
+        - Arn
 
   ######################################################################################################################
   # S3
@@ -96,4 +669,3 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: 'com.wicaksana.bigdata'
-
